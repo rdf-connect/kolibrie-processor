@@ -172,7 +172,7 @@ jobs:
       - name: Merge + flatten each crate's manifest, rename its libraries
         run: |
           set -euo pipefail
-          mkdir -p dist
+          mkdir -p dist merged
 
           for row in $(jq -c '.[]' crates.json); do
             pkg=$(echo "$row" | jq -r '.name')
@@ -182,8 +182,12 @@ jobs:
             # prefix (e.g. "rdfc-processor-echo" → "echo").
             crate_name=$(echo "$pkg" | sed 's/^rdfc-processor-//')
 
+            # Written to its own "merged/" dir, never into $dir: for a
+            # standalone (non-monorepo) crate repo, manifest_dir IS the repo
+            # root, so writing "merged-${pkg}.ttl" there would make it match
+            # the "$dir"/*.ttl glob below and get mistaken for a source TTL.
             rdfc-processor-buildtools merge \
-              "merged-${pkg}.ttl" \
+              "merged/${pkg}.ttl" \
               all-snippets/${pkg}-*.ttl
 
             # Flatten every source TTL in the crate directory (any .ttl that
@@ -210,7 +214,7 @@ jobs:
               rdfc-processor-buildtools flatten \
                 --crate-name "$crate_name" \
                 --processor-ttl "$ttl" \
-                --generated-ttl "merged-${pkg}.ttl" \
+                --generated-ttl "merged/${pkg}.ttl" \
                 --out-name "$out_name" \
                 --out-dir dist
             done
