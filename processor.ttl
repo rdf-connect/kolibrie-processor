@@ -1,0 +1,96 @@
+@prefix rdfc: <https://w3id.org/rdf-connect#>.
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#>.
+@prefix sh: <http://www.w3.org/ns/shacl#>.
+@prefix xsd: <http://www.w3.org/2001/XMLSchema#>.
+@prefix owl: <http://www.w3.org/2002/07/owl#>.
+@prefix : <https://w3id.org/rdf-connect/rust#>.
+
+# ── Processor declaration ─────────────────────────────────────────────────────
+#
+# This processor is distributed as prebuilt `cdylib`s — one per target triple.
+# There is no `rdfc:file` / `builtin://` mechanism: using this processor in a
+# pipeline is just `owl:import`ing this file (locally, or over http(s) from a
+# release). That single import brings in the class, its argument shape, and —
+# transitively, via the `owl:imports` below — its `:abiStable`/`:artifact`
+# declarations. The orchestrator's generic SHACL shape (declared once in the
+# Rust runner's own `index.ttl`, targeting subjects of
+# `:rustImplementationOf`) extracts those straight into `proc.config` as
+# JSON, resolving `:path` (declared as an IRI, so relative references
+# resolve against wherever the file was itself fetched from) to an absolute
+# path/URL along the way. The runner then:
+#
+#   1. Picks the `:artifact` entry whose `:targetTriple` matches its own
+#      compiled target (`rustc --print target-list` naming, e.g.
+#      `x86_64-unknown-linux-gnu`).
+#   2. Downloads it if `:path` is `http(s)://` (caching by `:sha256`), or
+#      opens it directly if it's a local path.
+#   3. Verifies the bytes against `:sha256`, when given — omitted entirely
+#      skips verification, e.g. for quick local-development iteration.
+#   4. Compares `:abiStable` against the runner's own SDK build — a mismatch
+#      fails immediately with a clear error, before anything is loaded.
+#
+# `generated.ttl` doesn't exist until this crate is built (`cargo build` runs
+# `build.rs`, which regenerates it every time via `rdfc-processor-buildtools`
+# — see build.rs) — it carries this class's `:abiStable` token and a
+# *single-target*, checksum-free `:artifact` entry pointing at your own local
+# build, always in sync with it. Never hand-edit it; it's gitignored.
+#
+# A *published* release is different: `.github/workflows/build-processor.yml`
+# builds every target triple, computes real checksums, and merges them into
+# its own multi-target `kolibrie-generated.ttl`, uploaded alongside a
+# `kolibrie.ttl` (a copy of this file with the import target rewritten to
+# match) — see that workflow for exactly how.
+#
+# Usage in a pipeline TTL:
+#   <> owl:imports <https://github.com/<org>/kolibrie-processor/releases/download/v0.1.0/kolibrie.ttl>.
+#   # (a local checkout works too: <> owl:imports </path/to/kolibrie-processor/processor.ttl>.)
+<> owl:imports <generated.ttl>.
+
+rdfc:KolibrieProcessor a rdfc:Processor;
+  rdfs:label "Kolibrie Reasoning Processor";
+  rdfs:comment "Reads RDF messages (Turtle, TriG, N-Triples or N-Quads, auto-detected) from a stream, applies Datalog rules using the Kolibrie engine, and writes derived facts as N-Triples to an output channel.";
+  :rustImplementationOf rdfc:Processor.
+
+# ── SHACL shape — parameters accepted by the processor ───────────────────────
+[ ] a sh:NodeShape;
+  sh:targetClass rdfc:KolibrieProcessor;
+  sh:property [
+    sh:path rdfc:reader;
+    sh:name "reader";
+    sh:class rdfc:Reader;
+    sh:minCount 1;
+    sh:maxCount 1;
+    sh:description "Input channel carrying RDF messages (Turtle/TriG/N-Triples/N-Quads, auto-detected).";
+  ], [
+    sh:path rdfc:writer;
+    sh:name "writer";
+    sh:class rdfc:Writer;
+    sh:minCount 1;
+    sh:maxCount 1;
+    sh:description "Output channel to which derived N-Triples are written.";
+  ], [
+    sh:path rdfc:rules;
+    sh:name "rules";
+    sh:datatype xsd:string;
+    sh:maxCount 1;
+    sh:description "Inline N3 Datalog rules (required when rules_file is absent).";
+  ], [
+    sh:path rdfc:rulesFile;
+    sh:name "rules_file";
+    sh:datatype xsd:anyURI;
+    sh:maxCount 1;
+    sh:description "Path to a file containing N3 Datalog rules.";
+  ], [
+    sh:path rdfc:windowSize;
+    sh:name "window_size";
+    sh:datatype xsd:integer;
+    sh:maxCount 1;
+    sh:description "Sliding-window width in seconds (0 = no windowing, default).";
+  ], [
+    sh:path rdfc:windowSlide;
+    sh:name "window_slide";
+    sh:datatype xsd:integer;
+    sh:maxCount 1;
+    sh:description "Window slide interval in seconds (0 = evaluate on every message, default).";
+  ].
+

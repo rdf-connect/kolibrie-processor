@@ -1,0 +1,49 @@
+[package]
+name = "rdfc-processor-kolibrie"
+version = "0.1.0"
+edition = "2021"
+description = "RDF-Connect processor that applies Kolibrie Datalog reasoning to incoming RDF streams"
+license = "MIT"
+repository = "https://github.com/TODO/kolibrie-processor"
+keywords = ["rdf", "rdf-connect", "reasoning", "datalog", "kolibrie"]
+
+include = [
+    "src/**",
+    "build.rs",
+    "processor.ttl",
+    "README.md",
+]
+
+[lib]
+# cdylib: this is what the runner loads at runtime via abi_stable (see
+# processor.ttl's per-target-triple artifact table). rlib is kept alongside
+# it purely so `cargo test` can run this crate's unit tests directly.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# RDF-Connect Rust runner SDK
+# When the runner is published, replace this path dep with a git / crates.io reference:
+#   rdfc-processor-sdk = { git = "https://github.com/TODO/rdfc-rust-runner" }
+rdfc-processor-sdk = "0.3.0"
+
+# `abi_stable`'s `#[export_root_module]` macro expands to code with an
+# absolute `::abi_stable::...` path, so it must be a direct dependency here
+# even though `rdfc-processor-sdk` re-exports the crate. Pin the exact same
+# version the runner uses — see rdfc_processor_sdk::ABI_TOKEN.
+abi_stable = "=0.11.3"
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Kolibrie reasoning engine — only the lightweight datalog + shared crates (no PyO3/ML).
+datalog = { git = "https://github.com/StreamIntelligenceLab/Kolibrie.git" }
+shared  = { git = "https://github.com/StreamIntelligenceLab/Kolibrie.git" }
+oxttl = "0.2.3"
+oxrdf = "0.3.3"
+
+[build-dependencies]
+rdfc-processor-buildtools = "0.3.0"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt"] }
+
