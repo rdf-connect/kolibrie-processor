@@ -62,11 +62,16 @@ jobs:
           sudo apt-get install -y ${{ matrix.cross_apt_package }}
           echo "CARGO_TARGET_$(echo ${{ matrix.target }} | tr '[:lower:]-' '[:upper:]_')_LINKER=${{ matrix.cross_linker }}" >> "$GITHUB_ENV"
 
-      - name: Build rdfc-processor-buildtools (host target)
-        run: cargo build --release -p rdfc-processor-buildtools
+      # rdfc-processor-buildtools is only ever a `[build-dependencies]` entry
+      # of the processor crate(s) here, never a workspace member, so cargo
+      # can't resolve `NormalOrDev` features for it via `cargo build -p`
+      # (that panics with "did not find features for ... within
+      # activated_features"). Install it as its own binary instead.
+      - name: Install rdfc-processor-buildtools (host target)
+        run: cargo install rdfc-processor-buildtools --locked
 
       - name: Add buildtools to PATH
-        run: echo "$GITHUB_WORKSPACE/target/release" >> "$GITHUB_PATH"
+        run: echo "$(dirname "$(which rdfc-processor-buildtools)")" >> "$GITHUB_PATH"
 
       - name: Discover processor crates
         id: discover
@@ -135,10 +140,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Build rdfc-processor-buildtools
-        run: cargo build --release -p rdfc-processor-buildtools
+      - name: Install rdfc-processor-buildtools
+        run: cargo install rdfc-processor-buildtools --locked
 
-      - run: echo "$GITHUB_WORKSPACE/target/release" >> "$GITHUB_PATH"
+      - run: echo "$(dirname "$(which rdfc-processor-buildtools)")" >> "$GITHUB_PATH"
 
       - uses: actions/download-artifact@v4
         with:
