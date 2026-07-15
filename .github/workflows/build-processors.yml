@@ -1,0 +1,224 @@
+name: Build and publish processor(s)
+
+# Builds every processor crate in this workspace (discovered via
+# `cargo metadata` — any workspace member whose `[lib].crate-type` includes
+# `cdylib`) as a `cdylib` for every target triple in the matrix below,
+# computes each artifact's real SHA-256, and publishes everything to one
+# GitHub Release:
+#
+#   <crate>.ttl              — processor.ttl with its `owl:imports` target
+#                               rewritten to <crate>-generated.ttl
+#   <crate>-<src>.ttl        — additional source TTLs for multi-processor
+#                               crates (e.g. send_processor.ttl becomes
+#                               <crate>-send_processor.ttl)
+#   <crate>-generated.ttl    — the merged, multi-target-triple :artifact table
+#   <crate>-lib<crate>-<target-triple>.<ext>  — the built libraries
+#
+# For multi-processor crates (more than one source .ttl), each source TTL is
+# published separately so consumers can reference just the processor(s) they
+# care about. All source TTLs in the same crate share one generated.ttl.
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch: {}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            ext: so
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            ext: so
+            cross_linker: aarch64-linux-gnu-gcc
+            cross_apt_package: gcc-aarch64-linux-gnu
+          - target: aarch64-apple-darwin
+            os: macos-14
+            ext: dylib
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (${{ matrix.target }})
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross-compilation linker
+        if: matrix.cross_apt_package != ''
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ${{ matrix.cross_apt_package }}
+          echo "CARGO_TARGET_$(echo ${{ matrix.target }} | tr '[:lower:]-' '[:upper:]_')_LINKER=${{ matrix.cross_linker }}" >> "$GITHUB_ENV"
+
+      - name: Build rdfc-processor-buildtools (host target)
+        run: cargo build --release -p rdfc-processor-buildtools
+
+      - name: Add buildtools to PATH
+        run: echo "$GITHUB_WORKSPACE/target/release" >> "$GITHUB_PATH"
+
+      - name: Discover processor crates
+        id: discover
+        shell: bash
+        run: |
+          set -euo pipefail
+          crates=$(cargo metadata --format-version 1 --no-deps | jq -c '
+            [ .packages[]
+              | select(.targets[]? | .kind[]? == "cdylib")
+              | { name, manifest_dir: (.manifest_path | rtrimstr("/Cargo.toml")) }
+            ]
+          ')
+          echo "$crates" > crates.json
+          echo "Discovered processor crates:"
+          jq -r '.[] | "  " + .name + " (" + .manifest_dir + ")"' crates.json
+
+      - name: Build, checksum, and snippet each discovered crate
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist-artifacts dist-snippets
+          abi_token=$(rdfc-processor-buildtools abi-token)
+
+          for row in $(jq -c '.[]' crates.json); do
+            pkg=$(echo "$row" | jq -r '.name')
+            dir=$(echo "$row" | jq -r '.manifest_dir')
+            lib_stem=$(echo "$pkg" | tr '-' '_')
+
+            cargo build --release --locked --target ${{ matrix.target }} -p "$pkg"
+
+            src="target/${{ matrix.target }}/release/lib${lib_stem}.${{ matrix.ext }}"
+            flat="lib${lib_stem}-${{ matrix.target }}.${{ matrix.ext }}"
+            cp "$src" "dist-artifacts/$flat"
+            sha256=$(rdfc-processor-buildtools checksum "dist-artifacts/$flat")
+
+            # Read class URIs from generated.ttl (produced by the build above)
+            # so that multi-processor crates (multiple source TTLs) are handled
+            # correctly — all classes end up in the same snippet file.
+            while read -r class_uri; do
+              [ -z "$class_uri" ] && continue
+              rdfc-processor-buildtools snippet \
+                --class "$class_uri" \
+                --abi-token "$abi_token" \
+                --target-triple ${{ matrix.target }} \
+                --path "$flat" \
+                --sha256 "$sha256" \
+                --out "dist-snippets/${pkg}-${{ matrix.target }}.ttl"
+            done < <(rdfc-processor-buildtools class-uris "$dir/generated.ttl")
+          done
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: built-libs-${{ matrix.target }}
+          path: dist-artifacts/*
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: snippets-${{ matrix.target }}
+          path: dist-snippets/*
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build rdfc-processor-buildtools
+        run: cargo build --release -p rdfc-processor-buildtools
+
+      - run: echo "$GITHUB_WORKSPACE/target/release" >> "$GITHUB_PATH"
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: built-libs-*
+          merge-multiple: true
+          path: all-libs
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: snippets-*
+          merge-multiple: true
+          path: all-snippets
+
+      - name: Discover processor crates
+        id: discover
+        run: |
+          set -euo pipefail
+          crates=$(cargo metadata --format-version 1 --no-deps | jq -c '
+            [ .packages[]
+              | select(.targets[]? | .kind[]? == "cdylib")
+              | { name, manifest_dir: (.manifest_path | rtrimstr("/Cargo.toml")) }
+            ]
+          ')
+          echo "$crates" > crates.json
+
+      - name: Merge + flatten each crate's manifest, rename its libraries
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+
+          for row in $(jq -c '.[]' crates.json); do
+            pkg=$(echo "$row" | jq -r '.name')
+            dir=$(echo "$row" | jq -r '.manifest_dir')
+
+            # Human-facing name prefix: strip the "rdfc-processor-" package
+            # prefix (e.g. "rdfc-processor-echo" → "echo").
+            crate_name=$(echo "$pkg" | sed 's/^rdfc-processor-//')
+
+            rdfc-processor-buildtools merge \
+              "merged-${pkg}.ttl" \
+              all-snippets/${pkg}-*.ttl
+
+            # Flatten every source TTL in the crate directory (any .ttl that
+            # is not generated.ttl). For crates with a single processor.ttl
+            # the output is <crate-name>.ttl; for additional source TTLs in
+            # multi-processor crates the output is <crate-name>-<stem>.ttl.
+            source_ttls=("$dir"/*.ttl)
+            ttl_count=0
+            for ttl in "${source_ttls[@]}"; do
+              [ "$(basename "$ttl")" = "generated.ttl" ] && continue
+              ttl_count=$((ttl_count + 1))
+            done
+
+            for ttl in "${source_ttls[@]}"; do
+              stem=$(basename "$ttl" .ttl)
+              [ "$stem" = "generated" ] && continue
+
+              if [ "$ttl_count" -eq 1 ] && [ "$stem" = "processor" ]; then
+                out_name="$crate_name"
+              else
+                out_name="${crate_name}-${stem}"
+              fi
+
+              rdfc-processor-buildtools flatten \
+                --crate-name "$crate_name" \
+                --processor-ttl "$ttl" \
+                --generated-ttl "merged-${pkg}.ttl" \
+                --out-name "$out_name" \
+                --out-dir dist
+            done
+
+            for lib in all-libs/lib$(echo "$pkg" | tr '-' '_')-*; do
+              cp "$lib" "dist/${crate_name}-$(basename "$lib")"
+            done
+          done
+
+          ls -l dist
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          fail_on_unmatched_files: true
