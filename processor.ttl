@@ -56,11 +56,10 @@ rdfc:KolibrieProcessor a rdfc:Processor;
   sh:targetClass rdfc:KolibrieProcessor;
   sh:property [
     sh:path rdfc:reader;
-    sh:name "reader";
+    sh:name "readers";
     sh:class rdfc:Reader;
     sh:minCount 1;
-    sh:maxCount 1;
-    sh:description "Input channel carrying RDF messages (Turtle/TriG/N-Triples/N-Quads, auto-detected).";
+    sh:description "One channel per RSP-QL stream: each Reader's own channel URI is matched against a `FROM NAMED WINDOW ... ON <stream-iri>` clause in rsp_query.";
   ], [
     sh:path rdfc:writer;
     sh:name "writer";
@@ -69,11 +68,23 @@ rdfc:KolibrieProcessor a rdfc:Processor;
     sh:maxCount 1;
     sh:description "Output channel to which derived N-Triples are written.";
   ], [
+    sh:path rdfc:rspQuery;
+    sh:name "rsp_query";
+    sh:datatype xsd:string;
+    sh:maxCount 1;
+    sh:description "Inline RSP-QL query text (required when rsp_query_file is absent). Declares one named window per stream (each with its own RANGE/STEP — this is how streams at different velocities are expressed) and the WHERE-clause patterns joining them.";
+  ], [
+    sh:path rdfc:rspQueryFile;
+    sh:name "rsp_query_file";
+    sh:datatype xsd:anyURI;
+    sh:maxCount 1;
+    sh:description "Path to a file containing the RSP-QL query text.";
+  ], [
     sh:path rdfc:rules;
     sh:name "rules";
     sh:datatype xsd:string;
     sh:maxCount 1;
-    sh:description "Inline N3 Datalog rules (required when rules_file is absent).";
+    sh:description "Inline N3 Datalog rules, applied by forward-chaining materialisation on every window firing (and, independently, on the capped_reader path). Optional.";
   ], [
     sh:path rdfc:rulesFile;
     sh:name "rules_file";
@@ -81,16 +92,28 @@ rdfc:KolibrieProcessor a rdfc:Processor;
     sh:maxCount 1;
     sh:description "Path to a file containing N3 Datalog rules.";
   ], [
-    sh:path rdfc:windowSize;
-    sh:name "window_size";
-    sh:datatype xsd:integer;
+    sh:path rdfc:syncPolicy;
+    sh:name "sync_policy";
+    sh:datatype xsd:string;
     sh:maxCount 1;
-    sh:description "Sliding-window width in seconds (0 = no windowing, default).";
+    sh:description "Engine-level default multi-window synchronisation policy: \"wait\" (default) or \"steal\". Overridden per-window by a WITH POLICY clause in rsp_query.";
   ], [
-    sh:path rdfc:windowSlide;
-    sh:name "window_slide";
+    sh:path rdfc:staticReader;
+    sh:name "static_reader";
+    sh:class rdfc:Reader;
+    sh:maxCount 1;
+    sh:description "Optional channel of permanent background data: messages accumulate forever (never evicted) and are joined into every window firing via WHERE-clause patterns outside any WINDOW block.";
+  ], [
+    sh:path rdfc:cappedReader;
+    sh:name "capped_reader";
+    sh:class rdfc:Reader;
+    sh:maxCount 1;
+    sh:description "Optional separate stream that keeps only the last max_per_subject messages per RDF subject. Reasons independently of the RSP-QL engine above (see README) since Kolibrie's windows have no API to forcibly evict a specific admitted item early.";
+  ], [
+    sh:path rdfc:maxPerSubject;
+    sh:name "max_per_subject";
     sh:datatype xsd:integer;
     sh:maxCount 1;
-    sh:description "Window slide interval in seconds (0 = evaluate on every message, default).";
+    sh:description "Required (> 0) when capped_reader is set: how many of the most recent messages to retain per RDF subject.";
   ].
 

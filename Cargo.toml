@@ -35,7 +35,12 @@ abi_stable = "=0.11.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
-# Kolibrie reasoning engine — only the lightweight datalog + shared crates (no PyO3/ML).
+# Kolibrie reasoning + RSP-QL streaming engine. Pulls in the full crate (including
+# its ml/pyo3/candle sub-crate, unused by this processor today) so we get the real
+# RSPBuilder/RSPEngine multi-stream windowing instead of hand-rolling our own.
+# `datalog`/`shared` are already pulled in transitively by `kolibrie` (same git repo,
+# same commit) but must be declared directly too since `kolibrie` doesn't re-export them.
+kolibrie = { git = "https://github.com/StreamIntelligenceLab/Kolibrie.git" }
 datalog = { git = "https://github.com/StreamIntelligenceLab/Kolibrie.git" }
 shared  = { git = "https://github.com/StreamIntelligenceLab/Kolibrie.git" }
 oxttl = "0.2.3"
