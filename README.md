@@ -86,6 +86,7 @@ cargo build --release -p rdfc-rust-runner   # from the rdfc-rust-runner repo
 | `rsp_query_file`   | anyURI   | *        | Path to a file containing the RSP-QL query text. |
 | `rules`            | string   | no       | Inline N3 Datalog rules. |
 | `rules_file`       | anyURI   | no       | Path to a file containing N3 Datalog rules. |
+| `sparql_rules`     | string[] | no       | Zero or more `RULE :Name :- CONSTRUCT {...} WHERE {... FILTER(...)}` rules — one array entry per complete rule. See below. |
 | `sync_policy`      | string   | no       | Multi-window sync policy: `"wait"` (default) or `"steal"`. Overridden per-window by `WITH POLICY` in `rsp_query`. |
 | `static_reader`    | Reader   | no       | Channel of permanent background data, accumulated forever and joined into every window firing. |
 | `capped_reader`    | Reader   | no       | Separate stream that keeps only the last `max_per_subject` messages per RDF subject (see below). |
@@ -155,6 +156,35 @@ predicate with a varying object — `ex:inMarineProtectedArea ex:True` /
 predicate ever takes. The rule parser also rejects string/numeric literals
 as rule terms (use an IRI constant instead) and doesn't support `#`
 comments. See `examples/echo-pipeline/ais-rules.n3` for a worked example.
+
+## SPARQL rule format (`sparql_rules`)
+
+Kolibrie has a second, distinct rule syntax alongside N3:
+
+```text
+PREFIX ex: <http://example.org/>
+RULE :FastMover :-
+CONSTRUCT { ?v ex:alert ex:FastMover . }
+WHERE {
+    ?v ex:distanceSinceLast ?d .
+    FILTER(?d > 5)
+}
+```
+
+Each `sparql_rules` array entry is one complete `RULE`; rules from `rules`/
+`rules_file` and `sparql_rules` are loaded together into the same rule set.
+
+This is the reliable way to do real numeric thresholding in a rule:
+`FILTER(?variable > literal)` is evaluated as its own step after pattern
+matching produces bindings — not folded into the buggy join above — and was
+verified to correctly reject non-matching subjects even when several share
+the filtered predicate with different values. Two things it can't do despite
+parsing without complaint: arithmetic between two different bound variables
+(`FILTER(?a - ?b > 0)` silently always passes; only `variable OP literal` and
+`variable =`/`!= variable` are actually evaluated), and
+aggregation/subqueries inside a rule body (`Rule` has no field to carry
+them). Compute both of those upstream in a plain processor and feed the
+result in as a ground fact for `FILTER` to threshold.
 
 ## Per-subject capped retention (`capped_reader`)
 

@@ -92,6 +92,11 @@ rdfc:KolibrieProcessor a rdfc:Processor;
     sh:maxCount 1;
     sh:description "Path to a file containing N3 Datalog rules.";
   ], [
+    sh:path rdfc:sparqlRule;
+    sh:name "sparql_rules";
+    sh:datatype xsd:string;
+    sh:description "Zero or more `RULE :Name :- CONSTRUCT { ... } WHERE { ... FILTER(...) }` rules (Kolibrie's other rule syntax) — one value per complete rule. Unlike an N3 premise, FILTER here does a real numeric comparison, evaluated as its own step after pattern matching.";
+  ], [
     sh:path rdfc:syncPolicy;
     sh:name "sync_policy";
     sh:datatype xsd:string;

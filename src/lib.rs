@@ -19,6 +19,7 @@
 //! | `rsp_query_file`    | string     | *        | Path to a file containing the RSP-QL query text                    |
 //! | `rules`             | string     | no       | Inline N3 Datalog rules                                            |
 //! | `rules_file`        | string     | no       | Path to a file containing N3 Datalog rules                         |
+//! | `sparql_rules`       | string[]   | no       | Zero or more `RULE :Name :- CONSTRUCT {...} WHERE {... FILTER(...)}` rules — see below |
 //! | `sync_policy`       | string     | no       | Multi-window sync policy: `"wait"` (default) or `"steal"`          |
 //! | `static_reader`     | Reader     | no       | Channel of permanent background data, accumulated forever and joined into every window firing |
 //! | `capped_reader`     | Reader     | no       | Separate stream that keeps only the last `max_per_subject` messages per RDF subject (see below) |
@@ -92,6 +93,47 @@
 //! bug entirely regardless of how many other subjects/predicates exist. See
 //! `examples/echo-pipeline/ais-rules.n3` in the kolibrie-processor examples
 //! for a worked example of this pattern.
+//!
+//! ## SPARQL rule format (`sparql_rules`)
+//!
+//! Kolibrie has a second, distinct rule syntax alongside N3 — `RULE :Name :-
+//! CONSTRUCT { ... } WHERE { ... FILTER(...) }` — parsed differently and, for
+//! `FILTER`, evaluated differently:
+//!
+//! ```text
+//! PREFIX ex: <http://example.org/>
+//! RULE :FastMover :-
+//! CONSTRUCT { ?v ex:alert ex:FastMover . }
+//! WHERE {
+//!     ?v ex:distanceSinceLast ?d .
+//!     FILTER(?d > 5)
+//! }
+//! ```
+//!
+//! Each element of `sparql_rules` is **one complete rule** (unlike `rules`,
+//! which can hold several N3 rules in one string) — pass one array entry per
+//! `RULE`. Rules from both `rules`/`rules_file` and `sparql_rules` are loaded
+//! into the same rule set and applied together.
+//!
+//! **This is the one reliable way to do real numeric thresholding in a
+//! rule.** `FILTER(?variable > literal)` is evaluated as its own step, after
+//! premise matching produces bindings — not folded into the (buggy) pattern
+//! join above — and was verified to correctly reject non-matching subjects
+//! even when several subjects share the filtered predicate with different
+//! values. Use it for anything that needs a numeric comparison against a
+//! constant (a distance, a count, a duration) rather than trying to encode
+//! it as another dedicated-predicate/constant-object pattern.
+//!
+//! Two things it can *not* do, despite the underlying parser accepting the
+//! syntax without complaint: arithmetic between two different bound
+//! variables (`FILTER(?d > 0)` works; `FILTER(?a - ?b > 0)` silently always
+//! passes — only `variable OP literal` and `variable = variable`/`variable
+//! != variable` are actually evaluated), and aggregation/subqueries inside a
+//! rule body (`shared::rule::Rule` has no field to carry them, so anything
+//! beyond plain patterns + filters + a conclusion is parsed and then
+//! dropped on the floor). Compute both of those upstream, in a plain
+//! processor, and feed the result in as a ground fact for a `sparql_rules`
+//! `FILTER` to threshold.
 //!
 //! ## Per-subject capped retention (`capped_reader`)
 //!
@@ -192,6 +234,15 @@ pub struct Args {
     rules: Option<String>,
     #[serde(default)]
     rules_file: Option<String>,
+    /// Zero or more `RULE :Name :- CONSTRUCT { ... } WHERE { ... FILTER(...) }`
+    /// rules (Kolibrie's other, non-N3 rule syntax) — each element is one
+    /// complete rule. Unlike N3 premises, `FILTER` here does a real numeric
+    /// comparison of an already-bound variable against a literal threshold
+    /// (or another bound variable, for `=`/`!=` only), evaluated as its own
+    /// step rather than folded into pattern matching — see the module doc
+    /// comment for why that distinction matters.
+    #[serde(default)]
+    sparql_rules: Vec<String>,
     #[serde(default)]
     sync_policy: Option<String>,
 }
@@ -211,6 +262,7 @@ pub struct Kolibrie {
     rsp_query_file: Option<String>,
     rules: Option<String>,
     rules_file: Option<String>,
+    sparql_rules: Vec<String>,
     sync_policy: Option<String>,
 }
 
@@ -231,6 +283,7 @@ impl Processor for Kolibrie {
             rsp_query_file: args.rsp_query_file,
             rules: args.rules,
             rules_file: args.rules_file,
+            sparql_rules: args.sparql_rules,
             sync_policy: args.sync_policy,
         }
     }
@@ -313,8 +366,9 @@ impl Processor for Kolibrie {
         };
 
         eprintln!(
-            "[kolibrie] loaded {} rule(s), {} reader(s){}{}",
+            "[kolibrie] loaded {} N3 rule(s), {} sparql rule(s), {} reader(s){}{}",
             parsed_rules.len(),
+            self.sparql_rules.len(),
             readers_raw.len(),
             if static_reader.is_some() { ", 1 static reader" } else { "" },
             if capped_reader.is_some() { ", 1 capped reader" } else { "" },
@@ -337,6 +391,9 @@ impl Processor for Kolibrie {
             .set_sync_policy(sync_policy);
         if let Some(rules) = &reconstructed_rules {
             builder = builder.add_rules(rules);
+        }
+        if !self.sparql_rules.is_empty() {
+            builder = builder.add_sparql_rules(self.sparql_rules.clone());
         }
         let mut engine = builder.build()?;
 
@@ -1147,6 +1204,49 @@ WHERE {
         assert!(
             text.contains("hasSensor"),
             "expected the high-velocity triple in output, got: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn sparql_rules_filter_rejects_non_matching_subject_by_value() {
+        // v1's distance is above the threshold (should alert); v2's is below
+        // (must not) -- this is the "constant object matched by predicate
+        // alone" bug's exact failure shape for N3 premises (see module doc
+        // comment), verified here to *not* apply to sparql_rules' FILTER.
+        const SPARQL_RULE: &str = r#"
+PREFIX ex: <http://example.org/>
+RULE :FastMover :-
+CONSTRUCT { ?v ex:alert ex:FastMover . }
+WHERE {
+    ?v ex:distanceSinceLast ?d .
+    FILTER(?d > 5)
+}"#;
+        let msgs = vec![
+            b"<http://example.org/v1> <http://example.org/distanceSinceLast> \"10\" .".to_vec(),
+            b"<http://example.org/v2> <http://example.org/distanceSinceLast> \"1\" .".to_vec(),
+        ];
+        let reader = make_test_reader("mock://reader", msgs);
+        let (writer, bridge) = make_writer("mock://writer".to_string());
+        let proc: super::Kolibrie = make_test_processor(
+            json!({
+                "readers": [{"@type": "https://w3id.org/rdf-connect#Reader", "@id": "mock://reader"}],
+                "writer": {"@type": "https://w3id.org/rdf-connect#Writer", "@id": "mock://writer"},
+                "rsp_query": SINGLE_STREAM_QUERY,
+                "sparql_rules": [SPARQL_RULE]
+            }),
+            [("reader", reader)],
+            [("writer", writer)],
+        );
+        let (result, (received, _)) = tokio::join!(proc.transform(), collect_writer(bridge));
+        result.unwrap();
+        let text = String::from_utf8(received.concat()).unwrap();
+        assert!(
+            text.contains("<http://example.org/v1> <http://example.org/alert> <http://example.org/FastMover>"),
+            "expected v1 (distance 10 > 5) to alert, got: {text}"
+        );
+        assert!(
+            !text.contains("<http://example.org/v2> <http://example.org/alert>"),
+            "expected v2 (distance 1, not > 5) to NOT alert, got: {text}"
         );
     }
 
