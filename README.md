@@ -90,6 +90,9 @@ cargo build --release -p rdfc-rust-runner   # from the rdfc-rust-runner repo
 | `static_reader`    | Reader   | no       | Channel of permanent background data, accumulated forever and joined into every window firing. |
 | `capped_reader`    | Reader   | no       | Separate stream that keeps only the last `max_per_subject` messages per RDF subject (see below). |
 | `max_per_subject`  | integer  | *        | Required (> 0) when `capped_reader` is set. |
+| `subject_timeout`  | integer  | no       | Requires `capped_reader`. Seconds of inactivity after which a subject's entry is evicted entirely (bounds memory under ever-growing subject cardinality). |
+| `silence_event`    | string   | no       | Requires `subject_timeout`. N-Triples line template (`{subject}` placeholder) injected in place of an evicted subject's stale readings. |
+| `capped_debounce_ms` | integer | no      | Requires `capped_reader`. Coalesce reasoning passes: wait this many ms after the last change before re-running. Omit for the fastest per-message response. |
 
 `rsp_query` or `rsp_query_file` is required (at least one must be provided).
 
@@ -138,6 +141,21 @@ Rules are loaded once at startup and applied via forward-chaining
 materialisation on every window firing (and, independently, on the
 `capped_reader` path below, if configured).
 
+**Known upstream limitation:** a rule premise with a constant object (e.g.
+`?v ex:inZone ex:MarineProtectedArea`) is matched by predicate alone —
+Kolibrie's semi-naive join doesn't actually check the object, so *any*
+subject with *any* `ex:inZone` triple satisfies it once more than one
+subject in the dataset uses that predicate with different values. It's
+unobservable with a single relevant subject or a premise using only
+variables (no constant terms), but real once several subjects share a
+predicate. Workaround: use a dedicated predicate per fact instead of one
+predicate with a varying object — `ex:inMarineProtectedArea ex:True` /
+`ex:inOpenSea ex:True` rather than `ex:inZone ex:MarineProtectedArea` /
+`ex:inZone ex:OpenSea` — so each premise's object is the only constant that
+predicate ever takes. The rule parser also rejects string/numeric literals
+as rule terms (use an IRI constant instead) and doesn't support `#`
+comments. See `examples/echo-pipeline/ais-rules.n3` for a worked example.
+
 ## Per-subject capped retention (`capped_reader`)
 
 Kolibrie's RSP-QL windows (`CSPARQLWindow`) only evict by time range — there is
@@ -155,3 +173,44 @@ already emitted is never retracted, even after its source triple is later
 evicted from the retained set. Joining a count-capped stream into the same
 RSP-QL query would require Kolibrie itself to support that concept; not
 attempted here.
+
+### Bounding memory: `subject_timeout` and `silence_event`
+
+`max_per_subject` alone only bounds each *existing* subject's own queue — a
+stream with ever-growing subject cardinality (e.g. sensor IDs that never
+repeat) would otherwise grow the subject-tracking map without bound for the
+life of the process. Set `subject_timeout` (seconds) to evict a subject's
+entry entirely once it's gone quiet for that long:
+
+```turtle
+rdfc:cappedReader   <ch-capped> ;
+rdfc:maxPerSubject  20 ;
+rdfc:subjectTimeout 300 ;
+rdfc:silenceEvent   "{subject} <http://example.org/status> \"silent\" ." ;
+```
+
+`silence_event` is optional and requires `subject_timeout`: an N-Triples line
+template with a `{subject}` placeholder, substituted with the evicted
+subject's own term and inserted **in place of** (not alongside) its stale
+readings — so a rule like `{ ?x ex:status ?s } => { ?x ex:alert ?s }` can react
+to "this subject stopped sending" the same way it would react to any other
+fact. Useful for detecting subjects that quietly stopped reporting.
+
+### Debouncing: `capped_debounce_ms`
+
+By default every `capped_reader` message triggers an immediate reasoning pass.
+Set `capped_debounce_ms` to coalesce bursts instead — wait that many
+milliseconds after the last change before re-running — trading a little
+latency for less redundant work under high-frequency input. Omit it for the
+fastest (immediate, per-message) response.
+
+### Reasoning efficiency
+
+Reasoning passes are incremental where possible: a single, persistent
+`Reasoner` is fed only the triples admitted since the last pass. A full
+rebuild from the current retained set only happens immediately after an
+eviction (from `max_per_subject` or `subject_timeout`) — Kolibrie's semi-naive
+materialisation has no retraction/truth-maintenance support, so deleting one
+ground fact wouldn't retract facts previously derived from it; rebuilding is
+the only way this engine can guarantee correctness once something is evicted.
+Passes triggered by ordinary new messages (no eviction involved) stay cheap.

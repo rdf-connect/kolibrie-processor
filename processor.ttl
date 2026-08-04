@@ -115,5 +115,23 @@ rdfc:KolibrieProcessor a rdfc:Processor;
     sh:datatype xsd:integer;
     sh:maxCount 1;
     sh:description "Required (> 0) when capped_reader is set: how many of the most recent messages to retain per RDF subject.";
+  ], [
+    sh:path rdfc:subjectTimeout;
+    sh:name "subject_timeout";
+    sh:datatype xsd:integer;
+    sh:maxCount 1;
+    sh:description "Requires capped_reader. Seconds of inactivity after which a subject's tracked entry is evicted entirely, bounding memory even under ever-growing subject cardinality (max_per_subject alone only bounds each existing subject's own queue).";
+  ], [
+    sh:path rdfc:silenceEvent;
+    sh:name "silence_event";
+    sh:datatype xsd:string;
+    sh:maxCount 1;
+    sh:description "Requires subject_timeout. N-Triples line template (with a {subject} placeholder) injected in place of an evicted subject's stale readings, so rules can react to that subject having gone silent.";
+  ], [
+    sh:path rdfc:cappedDebounceMs;
+    sh:name "capped_debounce_ms";
+    sh:datatype xsd:integer;
+    sh:maxCount 1;
+    sh:description "Requires capped_reader. Coalesce capped_reader reasoning passes: wait this many ms after the last change before re-running, instead of on every message. Omit for the fastest (immediate) response.";
   ].
 

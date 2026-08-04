@@ -46,9 +46,16 @@ shared  = { git = "https://github.com/StreamIntelligenceLab/Kolibrie.git" }
 oxttl = "0.2.3"
 oxrdf = "0.3.3"
 
+# Just the channel type (no reactor/runtime) — bridges the capped_reader
+# ticker thread (plain std::thread + std::thread::sleep, no ambient Tokio
+# runtime needed) into the async transform() loop. Safe under the SDK's
+# "don't rely on an ambient Tokio runtime" rule since `sync` alone pulls in
+# no reactor/timer driver.
+tokio = { version = "1", default-features = false, features = ["sync"] }
+
 [build-dependencies]
 rdfc-processor-buildtools = "0.3.0"
 
 [dev-dependencies]
-tokio = { version = "1", features = ["macros", "rt"] }
+tokio = { version = "1", features = ["macros", "rt", "time"] }
 

@@ -23,6 +23,9 @@
 //! | `static_reader`     | Reader     | no       | Channel of permanent background data, accumulated forever and joined into every window firing |
 //! | `capped_reader`     | Reader     | no       | Separate stream that keeps only the last `max_per_subject` messages per RDF subject (see below) |
 //! | `max_per_subject`   | integer    | *        | Required (> 0) when `capped_reader` is set                         |
+//! | `subject_timeout`   | integer    | no       | Seconds of inactivity after which a capped_reader subject is evicted entirely (bounds memory; requires `capped_reader`) |
+//! | `silence_event`     | string     | no       | N-Triples template (`{subject}` placeholder) injected when `subject_timeout` fires (requires `subject_timeout`) |
+//! | `capped_debounce_ms`| integer    | no       | Coalesce capped_reader reasoning passes: wait this many ms after the last change before re-running (requires `capped_reader`; omit for immediate/fastest response) |
 //!
 //! `rsp_query` or `rsp_query_file` is required (at least one must be provided).
 //!
@@ -69,6 +72,27 @@
 //! materialisation on every window firing (and, independently, in the
 //! `capped_reader` path below).
 //!
+//! **Known upstream limitation — constant objects in a rule premise aren't
+//! actually checked.** A premise like `?v ex:inZone ex:MarineProtectedArea`
+//! is matched by Kolibrie's semi-naive join as if it were `?v ex:inZone ?_`
+//! — any subject with *any* `ex:inZone` triple satisfies it, regardless of
+//! the object. This only bites when more than one subject in the dataset
+//! shares that predicate with *different* object values (e.g. six vessels
+//! each with their own `inZone`) — with a single relevant subject, or a rule
+//! using only variables (no constant terms at all, e.g. a `?z`/`?r`
+//! transitive-closure premise), it's unobservable and everything behaves
+//! correctly. The rule engine also doesn't accept string/numeric literals as
+//! rule terms at all (only IRIs and variables — `"silent"` fails to parse;
+//! `ex:Silent` works) and doesn't support `#` comments in rule files.
+//! **Workaround:** give each fact its own dedicated predicate instead of
+//! sharing one predicate with varying objects — `ex:inMarineProtectedArea
+//! ex:True` / `ex:inOpenSea ex:True` instead of `ex:inZone
+//! ex:MarineProtectedArea` / `ex:inZone ex:OpenSea` — so a premise's object
+//! is always the one constant that predicate ever takes, which sidesteps the
+//! bug entirely regardless of how many other subjects/predicates exist. See
+//! `examples/echo-pipeline/ais-rules.n3` in the kolibrie-processor examples
+//! for a worked example of this pattern.
+//!
 //! ## Per-subject capped retention (`capped_reader`)
 //!
 //! Kolibrie's RSP-QL windows only evict by time range — there is no API to
@@ -79,14 +103,45 @@
 //! re-runs the same Datalog rules over exactly that retained set whenever it
 //! changes. **This path reasons independently of the RSP-QL engine above —
 //! its output is not joined with the windowed/static streams.**
+//!
+//! `max_per_subject` alone only bounds each *existing* subject's own queue —
+//! a stream with ever-growing subject cardinality (new sensor IDs that never
+//! repeat, say) would otherwise grow the subject-tracking map without bound.
+//! Set `subject_timeout` (seconds) to evict a subject's entry entirely once
+//! it's gone quiet for that long. Optionally pair it with `silence_event` — an
+//! N-Triples line template with a `{subject}` placeholder — to inject a fact
+//! in place of the evicted subject's stale readings so your own rules can
+//! react to "this subject stopped sending", e.g. to raise an alert:
+//!
+//! ```text
+//! "silence_event": "{subject} <http://example.org/status> \"silent\" ."
+//! ```
+//!
+//! By default every capped_reader message triggers an immediate reasoning
+//! pass. Set `capped_debounce_ms` to coalesce bursts instead — wait that many
+//! ms after the last change before re-running — trading latency for less
+//! redundant work; omit it for the fastest per-message response.
+//!
+//! Internally, reasoning passes are incremental (a persistent `Reasoner` is
+//! only ever fed newly-admitted triples) *except* immediately after an
+//! eviction (from either the per-subject cap or `subject_timeout`), which
+//! forces one full rebuild from the current retained set — Kolibrie's
+//! semi-naive materialisation has no retraction/truth-maintenance support, so
+//! that's the only way to guarantee correctness once a ground fact is
+//! removed.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, RwLock};
+use std::time::{Duration, Instant};
 
 use rdfc_processor_sdk::{
     bytes::Bytes,
-    futures::{stream::select_all, Stream, StreamExt},
+    futures::{
+        future::{select, Either},
+        stream::select_all,
+        Stream, StreamExt,
+    },
     Processor, Reader, Slot, Writer,
 };
 
@@ -113,6 +168,22 @@ pub struct Args {
     capped_reader: Option<Reader>,
     #[serde(default)]
     max_per_subject: u64,
+    /// Seconds of inactivity after which a subject's capped_reader entry is
+    /// evicted (bounds `per_subject` memory even for ever-growing subject
+    /// cardinality). Requires `capped_reader`.
+    #[serde(default)]
+    subject_timeout: Option<u64>,
+    /// N-Triples-line template (with a `{subject}` placeholder) inserted in
+    /// place of an evicted subject's retained readings when `subject_timeout`
+    /// fires, so rules can react to "this subject went silent". Requires
+    /// `subject_timeout`.
+    #[serde(default)]
+    silence_event: Option<String>,
+    /// Coalesce capped_reader reasoning passes: wait this many ms after the
+    /// last change before re-running, instead of on every message. Requires
+    /// `capped_reader`; omit for the fastest (immediate) response.
+    #[serde(default)]
+    capped_debounce_ms: Option<u64>,
     #[serde(default)]
     rsp_query: Option<String>,
     #[serde(default)]
@@ -133,6 +204,9 @@ pub struct Kolibrie {
     static_reader: Slot<Option<Reader>>,
     capped_reader: Slot<Option<Reader>>,
     max_per_subject: u64,
+    subject_timeout: Option<u64>,
+    silence_event: Option<String>,
+    capped_debounce_ms: Option<u64>,
     rsp_query: Option<String>,
     rsp_query_file: Option<String>,
     rules: Option<String>,
@@ -150,6 +224,9 @@ impl Processor for Kolibrie {
             static_reader: Slot::new(args.static_reader),
             capped_reader: Slot::new(args.capped_reader),
             max_per_subject: args.max_per_subject,
+            subject_timeout: args.subject_timeout,
+            silence_event: args.silence_event,
+            capped_debounce_ms: args.capped_debounce_ms,
             rsp_query: args.rsp_query,
             rsp_query_file: args.rsp_query_file,
             rules: args.rules,
@@ -167,6 +244,22 @@ impl Processor for Kolibrie {
         if capped_reader.is_some() && self.max_per_subject == 0 {
             return Err(
                 "kolibrie processor: 'max_per_subject' must be > 0 when 'capped_reader' is set"
+                    .to_string(),
+            );
+        }
+        if capped_reader.is_none()
+            && (self.subject_timeout.is_some()
+                || self.silence_event.is_some()
+                || self.capped_debounce_ms.is_some())
+        {
+            return Err(
+                "kolibrie processor: 'subject_timeout', 'silence_event' and 'capped_debounce_ms' require 'capped_reader' to be set"
+                    .to_string(),
+            );
+        }
+        if self.silence_event.is_some() && self.subject_timeout.is_none() {
+            return Err(
+                "kolibrie processor: 'silence_event' requires 'subject_timeout' to be set"
                     .to_string(),
             );
         }
@@ -281,8 +374,91 @@ impl Processor for Kolibrie {
         let mut written: HashSet<String> = HashSet::new();
         let mut per_subject: HashMap<u32, VecDeque<Triple>> = HashMap::new();
         let mut capped_written: HashSet<Triple> = HashSet::new();
+        let mut last_seen: HashMap<u32, Instant> = HashMap::new();
+        // Triples admitted since the last capped-reasoning pass but not yet
+        // inserted into `capped_reasoner` — only used on the fast (no-rebuild) path.
+        let mut pending_inserts: Vec<Triple> = Vec::new();
+        let mut capped_needs_rebuild = false;
+        let mut capped_pending = false;
+        let mut capped_last_change = Instant::now();
 
-        while let Some(item) = merged.next().await {
+        // Built once (rules never change during the stream) and then mutated
+        // in place: only its `dataset_index` gets reset, and only when an
+        // eviction actually happened — see `run_capped_pass`.
+        let mut capped_reasoner: Option<Reasoner> = if self.max_per_subject > 0 {
+            Some(build_capped_reasoner(&parsed_rules, &rules_dict))
+        } else {
+            None
+        };
+
+        // A ticker thread (plain std::thread + std::thread::sleep — no ambient
+        // Tokio runtime needed, see rdfc_processor_sdk's module docs) drives
+        // `subject_timeout` sweeps and `capped_debounce_ms` flushes. It is kept
+        // OUT of `merged` deliberately: `select_all` only ends once every one of
+        // its streams ends, and this ticker never ends on its own — merging it in
+        // would make `transform()` hang forever even after every real reader
+        // closes. Instead it's polled via `futures::future::select` below, so the
+        // loop can end as soon as `merged` is exhausted, regardless of the ticker.
+        let mut tick_rx: Option<tokio::sync::mpsc::UnboundedReceiver<()>> =
+            if self.subject_timeout.is_some() || self.capped_debounce_ms.is_some() {
+                let tick_ms = self.capped_debounce_ms.unwrap_or(250).min(250).max(20);
+                let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+                std::thread::spawn(move || loop {
+                    std::thread::sleep(Duration::from_millis(tick_ms));
+                    if tx.send(()).is_err() {
+                        break; // main loop ended; stop ticking
+                    }
+                });
+                Some(rx)
+            } else {
+                None
+            };
+
+        loop {
+            let item = if let Some(rx) = tick_rx.as_mut() {
+                match select(Box::pin(merged.next()), Box::pin(rx.recv())).await
+                {
+                    Either::Left((Some(item), _)) => item,
+                    Either::Left((None, _)) => break, // every real reader closed
+                    Either::Right((_tick, _)) => {
+                        handle_capped_tick(
+                            self.subject_timeout,
+                            self.silence_event.as_deref(),
+                            self.capped_debounce_ms,
+                            &mut per_subject,
+                            &mut last_seen,
+                            &rules_dict,
+                            &mut capped_needs_rebuild,
+                            &mut capped_pending,
+                            &mut capped_last_change,
+                        );
+                        if capped_pending
+                            && ready_to_flush(self.capped_debounce_ms, capped_last_change)
+                        {
+                            if let Some(reasoner) = capped_reasoner.as_mut() {
+                                run_capped_pass(
+                                    reasoner,
+                                    &per_subject,
+                                    &mut pending_inserts,
+                                    &mut capped_needs_rebuild,
+                                    &mut capped_written,
+                                    &rules_dict,
+                                    &writer,
+                                )
+                                .await?;
+                            }
+                            capped_pending = false;
+                        }
+                        continue;
+                    }
+                }
+            } else {
+                match merged.next().await {
+                    Some(item) => item,
+                    None => break,
+                }
+            };
+
             match item {
                 Incoming::Window(idx, bytes) => {
                     let text = String::from_utf8_lossy(&bytes);
@@ -304,17 +480,33 @@ impl Processor for Kolibrie {
                     let text = String::from_utf8_lossy(&bytes);
                     let batch = parse_rdf(&text, &mut *rules_dict.write().unwrap());
                     if !batch.is_empty() {
+                        let now = Instant::now();
                         for triple in batch {
-                            admit_capped(&mut per_subject, triple, self.max_per_subject);
+                            last_seen.insert(triple.subject, now);
+                            let evicted =
+                                admit_capped(&mut per_subject, triple.clone(), self.max_per_subject);
+                            if evicted {
+                                capped_needs_rebuild = true;
+                            }
+                            pending_inserts.push(triple);
                         }
-                        run_capped_reasoner(
-                            &parsed_rules,
-                            &rules_dict,
-                            &per_subject,
-                            &mut capped_written,
-                            &writer,
-                        )
-                        .await?;
+                        capped_pending = true;
+                        capped_last_change = now;
+                        if ready_to_flush(self.capped_debounce_ms, capped_last_change) {
+                            if let Some(reasoner) = capped_reasoner.as_mut() {
+                                run_capped_pass(
+                                    reasoner,
+                                    &per_subject,
+                                    &mut pending_inserts,
+                                    &mut capped_needs_rebuild,
+                                    &mut capped_written,
+                                    &rules_dict,
+                                    &writer,
+                                )
+                                .await?;
+                            }
+                            capped_pending = false;
+                        }
                     }
                 }
             }
@@ -324,6 +516,21 @@ impl Processor for Kolibrie {
 
         engine.stop();
         drain_rsp_output(&output_buf, &mut written, &writer).await?;
+        // Flush any capped-reader change still pending behind an unexpired debounce.
+        if capped_pending {
+            if let Some(reasoner) = capped_reasoner.as_mut() {
+                run_capped_pass(
+                    reasoner,
+                    &per_subject,
+                    &mut pending_inserts,
+                    &mut capped_needs_rebuild,
+                    &mut capped_written,
+                    &rules_dict,
+                    &writer,
+                )
+                .await?;
+            }
+        }
 
         writer.close();
         Ok(())
@@ -458,34 +665,79 @@ fn parse_rules(text: &str, seed_reasoner: &mut Reasoner) -> Result<Vec<Rule>, St
 // ── Capped-per-subject retention (Stage 2, independent of the RSP-QL engine) ──
 
 /// Push `triple` onto its subject's retained queue, evicting the oldest entry
-/// once the queue exceeds `max_per_subject`. A standalone function so eviction
-/// itself can be unit-tested directly, decoupled from `run_capped_reasoner`'s
-/// append-only (no-retraction) output stream — a fact already emitted stays
-/// emitted even after its source triple is evicted here, same as this crate's
-/// previous time-windowed `run_windowed` always behaved.
+/// once the queue exceeds `max_per_subject`. Returns whether an eviction
+/// happened, so the caller can tell `run_capped_pass` when it must fall back to
+/// a full rebuild instead of a cheap incremental insert (see that function's
+/// doc comment for why). A standalone function so eviction itself can be
+/// unit-tested directly, decoupled from `run_capped_pass`'s append-only
+/// (no-retraction) output stream — a fact already emitted stays emitted even
+/// after its source triple is evicted here, same as this crate's previous
+/// time-windowed `run_windowed` always behaved.
 fn admit_capped(
     per_subject: &mut HashMap<u32, VecDeque<Triple>>,
     triple: Triple,
     max_per_subject: u64,
-) {
+) -> bool {
     let deque = per_subject.entry(triple.subject).or_default();
     deque.push_back(triple);
+    let mut evicted = false;
     while deque.len() as u64 > max_per_subject {
         deque.pop_front();
+        evicted = true;
     }
+    evicted
 }
 
-/// Rebuild a fresh [`Reasoner`] from exactly the currently-retained triples
-/// (the last `max_per_subject` per RDF subject) and emit any newly-derived
-/// facts not already written. Mirrors this crate's previous time-windowed
-/// approach, just keyed by subject instead of by arrival time.
-async fn run_capped_reasoner(
-    rules: &[Rule],
-    dict: &Arc<RwLock<Dictionary>>,
-    per_subject: &HashMap<u32, VecDeque<Triple>>,
-    written: &mut HashSet<Triple>,
-    writer: &Writer,
-) -> Result<(), String> {
+/// Find subjects in `last_seen` that haven't been touched within `timeout` of
+/// `now`, removing them from both `last_seen` and `per_subject` (this is what
+/// actually bounds `per_subject`'s memory for ever-growing subject
+/// cardinality — `admit_capped` alone only bounds each *existing* subject's
+/// queue length). Returns the evicted subject ids so the caller can decide
+/// whether to inject a `silence_event`. Takes `now` as a parameter (rather
+/// than calling `Instant::now()` itself) so it can be unit-tested with
+/// synthetic timestamps instead of real sleeps.
+fn sweep_stale_subjects(
+    per_subject: &mut HashMap<u32, VecDeque<Triple>>,
+    last_seen: &mut HashMap<u32, Instant>,
+    now: Instant,
+    timeout: Duration,
+) -> Vec<u32> {
+    let stale: Vec<u32> = last_seen
+        .iter()
+        .filter(|(_, &t)| now.duration_since(t) >= timeout)
+        .map(|(&s, _)| s)
+        .collect();
+    for subject in &stale {
+        last_seen.remove(subject);
+        per_subject.remove(subject);
+    }
+    stale
+}
+
+/// Build the N-Triples line(s) for a `silence_event` template, substituting
+/// every `{subject}` occurrence with `subject`'s decoded, correctly-formatted
+/// term (`<iri>` or `_:bnode`), then parsing the result against `dict`.
+/// Returns an empty `Vec` (with a warning logged) if `subject` can't be
+/// decoded or the substituted template doesn't parse as valid RDF.
+fn build_silence_triples(template: &str, subject: u32, dict: &mut Dictionary) -> Vec<Triple> {
+    let Some(subject_str) = dict.decode(subject).map(|s| s.to_string()) else {
+        eprintln!("[kolibrie] warning: silence_event: could not decode evicted subject");
+        return Vec::new();
+    };
+    let text = template.replace("{subject}", &nt_term(&subject_str));
+    let triples = parse_rdf(&text, dict);
+    if triples.is_empty() {
+        eprintln!(
+            "[kolibrie] warning: silence_event template produced no valid triples (subject: {subject_str})"
+        );
+    }
+    triples
+}
+
+/// Build the persistent capped-retention [`Reasoner`], loaded with `rules`
+/// once. Only ever called once per stream — `run_capped_pass` mutates the
+/// same instance's `dataset_index` in place afterward.
+fn build_capped_reasoner(rules: &[Rule], dict: &Arc<RwLock<Dictionary>>) -> Reasoner {
     let mut reasoner = Reasoner {
         dictionary: Arc::clone(dict),
         rules: Vec::new(),
@@ -499,9 +751,101 @@ async fn run_capped_reasoner(
             eprintln!("[kolibrie] warning: skipping rule: {e}");
         }
     }
-    for deque in per_subject.values() {
-        for triple in deque {
-            reasoner.insert_ground_triple(triple.clone());
+    reasoner
+}
+
+/// Whether a pending capped-reader change should be flushed now: immediately
+/// when no debounce is configured, otherwise once `capped_debounce_ms` has
+/// elapsed since the last change.
+fn ready_to_flush(debounce_ms: Option<u64>, last_change: Instant) -> bool {
+    match debounce_ms {
+        Some(ms) => Instant::now().duration_since(last_change) >= Duration::from_millis(ms),
+        None => true,
+    }
+}
+
+/// Handle one ticker firing: sweep `subject_timeout`-expired subjects (if
+/// configured), optionally injecting `silence_event` triples in place of each
+/// evicted subject's stale readings and marking a pass as pending. Does not
+/// itself run the reasoning pass — the caller checks `ready_to_flush`.
+#[allow(clippy::too_many_arguments)]
+fn handle_capped_tick(
+    subject_timeout: Option<u64>,
+    silence_event: Option<&str>,
+    _capped_debounce_ms: Option<u64>,
+    per_subject: &mut HashMap<u32, VecDeque<Triple>>,
+    last_seen: &mut HashMap<u32, Instant>,
+    dict: &Arc<RwLock<Dictionary>>,
+    needs_rebuild: &mut bool,
+    pending: &mut bool,
+    last_change: &mut Instant,
+) {
+    let Some(timeout_secs) = subject_timeout else {
+        return;
+    };
+    let now = Instant::now();
+    let stale = sweep_stale_subjects(per_subject, last_seen, now, Duration::from_secs(timeout_secs));
+    if stale.is_empty() {
+        return;
+    }
+
+    if let Some(template) = silence_event {
+        let mut dict_w = dict.write().unwrap();
+        for subject in &stale {
+            let triples = build_silence_triples(template, *subject, &mut dict_w);
+            if !triples.is_empty() {
+                // Replace (not append to) the evicted subject's retained set —
+                // its stale readings are gone; only the fact that it went
+                // silent remains.
+                per_subject.insert(*subject, VecDeque::from(triples));
+            }
+        }
+    }
+
+    *needs_rebuild = true;
+    *pending = true;
+    *last_change = now;
+}
+
+/// Re-run capped-retention reasoning: a cheap incremental insert of whatever's
+/// queued in `pending_inserts` when nothing was evicted since the last pass,
+/// or — only when `needs_rebuild` is set (an eviction happened, whether from
+/// `admit_capped`'s per-subject cap or a `subject_timeout` sweep) — a full
+/// rebuild of `reasoner`'s ground facts from `per_subject`.
+///
+/// A full rebuild is genuinely required after an eviction: `Reasoner`'s
+/// semi-naive materialisation (see `datalog::reasoning::materialisation::
+/// semi_naive`) has no retraction/truth-maintenance support — deleting one
+/// ground fact from a live `DatasetIndex` (which `DatasetIndex::delete_triple`
+/// does support) would NOT retract facts previously derived *from* it, so a
+/// persisted reasoner could keep deriving new conclusions from stale premises
+/// forever. Rebuilding from the current `per_subject` contents is the only way
+/// this engine can guarantee correctness after eviction. When nothing was
+/// evicted, though, plain incremental insertion is exactly how this crate's
+/// non-evicting `run_incremental` mode has always worked, and is safe here for
+/// the same reason.
+#[allow(clippy::too_many_arguments)]
+async fn run_capped_pass(
+    reasoner: &mut Reasoner,
+    per_subject: &HashMap<u32, VecDeque<Triple>>,
+    pending_inserts: &mut Vec<Triple>,
+    needs_rebuild: &mut bool,
+    written: &mut HashSet<Triple>,
+    dict: &Arc<RwLock<Dictionary>>,
+    writer: &Writer,
+) -> Result<(), String> {
+    if *needs_rebuild {
+        reasoner.dataset_index = DatasetIndex::new();
+        for deque in per_subject.values() {
+            for triple in deque {
+                reasoner.insert_ground_triple(triple.clone());
+            }
+        }
+        *needs_rebuild = false;
+        pending_inserts.clear();
+    } else {
+        for triple in pending_inserts.drain(..) {
+            reasoner.insert_ground_triple(triple);
         }
     }
 
@@ -878,6 +1222,170 @@ WHERE {
             .map(|t| dict.decode(t.object).unwrap())
             .collect();
         assert_eq!(values, vec!["2", "3"], "expected reading 1 to have been evicted");
+    }
+
+    #[test]
+    fn admit_capped_reports_no_eviction_under_cap() {
+        let mut per_subject: HashMap<u32, VecDeque<Triple>> = HashMap::new();
+        let t = Triple { subject: 1, predicate: 2, object: 3 };
+        assert!(
+            !admit_capped(&mut per_subject, t, 5),
+            "should not report eviction while under the cap"
+        );
+    }
+
+    #[test]
+    fn sweep_stale_subjects_evicts_after_timeout_and_bounds_per_subject() {
+        let mut per_subject: HashMap<u32, VecDeque<Triple>> = HashMap::new();
+        let mut last_seen: HashMap<u32, Instant> = HashMap::new();
+
+        let stale_subject = 1u32;
+        let fresh_subject = 2u32;
+        let t0 = Instant::now();
+        per_subject.insert(stale_subject, VecDeque::from([Triple { subject: 1, predicate: 9, object: 9 }]));
+        per_subject.insert(fresh_subject, VecDeque::from([Triple { subject: 2, predicate: 9, object: 9 }]));
+        // Synthetic timestamps rather than real sleeps: subject 1 was last seen
+        // 10s "ago" relative to `now`, subject 2 only 1s ago.
+        last_seen.insert(stale_subject, t0);
+        last_seen.insert(fresh_subject, t0);
+        let now = t0 + Duration::from_secs(10);
+        // Bump the fresh subject's last-seen to 1s before `now`.
+        last_seen.insert(fresh_subject, now - Duration::from_secs(1));
+
+        let evicted = sweep_stale_subjects(&mut per_subject, &mut last_seen, now, Duration::from_secs(5));
+
+        assert_eq!(evicted, vec![stale_subject]);
+        assert!(!per_subject.contains_key(&stale_subject), "stale subject's entry must be fully removed, not just trimmed");
+        assert!(!last_seen.contains_key(&stale_subject));
+        assert!(per_subject.contains_key(&fresh_subject), "fresh subject must be untouched");
+        assert!(last_seen.contains_key(&fresh_subject));
+    }
+
+    #[test]
+    fn build_silence_triples_substitutes_subject_placeholder() {
+        let mut dict = Dictionary::new();
+        let subject = dict.encode("http://example.org/sensor");
+
+        let triples = build_silence_triples(
+            "{subject} <http://example.org/status> \"silent\" .",
+            subject,
+            &mut dict,
+        );
+
+        assert_eq!(triples.len(), 1, "expected exactly one triple, got: {triples:?}");
+        assert_eq!(dict.decode(triples[0].subject), Some("http://example.org/sensor"));
+        assert_eq!(dict.decode(triples[0].predicate), Some("http://example.org/status"));
+        assert_eq!(dict.decode(triples[0].object), Some(r#""silent""#));
+    }
+
+    #[test]
+    fn build_silence_triples_warns_and_returns_empty_on_bad_template() {
+        let mut dict = Dictionary::new();
+        let subject = dict.encode("http://example.org/sensor");
+        let triples = build_silence_triples("not valid rdf at all {subject}", subject, &mut dict);
+        assert!(triples.is_empty());
+    }
+
+    // Real end-to-end wiring check for subject_timeout + silence_event: keeps
+    // the capped_reader bridge open (unlike make_test_reader, which auto-closes)
+    // so the background ticker thread gets a chance to actually fire while
+    // `transform()` is still running. subject_timeout=0 means the very first
+    // tick (internally every 250ms) evicts the subject; the 600ms wait is a
+    // generous multiple of that to avoid flakiness from scheduling jitter.
+    #[tokio::test]
+    async fn subject_timeout_evicts_and_injects_silence_event() {
+        // `run_capped_pass` only emits rule-*derived* facts, never raw ground
+        // facts — so the rule set needs a rule that actually reacts to the
+        // injected silence marker for it to show up in output at all.
+        const RULES2: &str = r#"
+@prefix ex: <http://example.org/> .
+{ ?x ex:hasReading ?y } => { ?x ex:hasRecentReading ?y }
+{ ?x ex:status ?s } => { ?x ex:reactedToStatus ?s }
+"#;
+        let (capped_reader, capped_bridge) = rdfc_processor_sdk::make_reader("mock://capped".to_string());
+        let dummy_window = make_test_reader("mock://reader", vec![]);
+        let (writer, bridge) = make_writer("mock://writer".to_string());
+        let proc: super::Kolibrie = make_test_processor(
+            json!({
+                "readers": [{"@type": "https://w3id.org/rdf-connect#Reader", "@id": "mock://reader"}],
+                "writer": {"@type": "https://w3id.org/rdf-connect#Writer", "@id": "mock://writer"},
+                "rsp_query": SINGLE_STREAM_QUERY,
+                "rules": RULES2,
+                "capped_reader": {"@type": "https://w3id.org/rdf-connect#Reader", "@id": "mock://capped"},
+                "max_per_subject": 5,
+                "subject_timeout": 0,
+                "silence_event": "{subject} <http://example.org/status> \"silent\" ."
+            }),
+            [("reader", dummy_window), ("capped", capped_reader)],
+            [("writer", writer)],
+        );
+
+        capped_bridge
+            .send(Bytes::from_static(
+                b"<http://example.org/sensor> <http://example.org/hasReading> \"1\" .",
+            ))
+            .unwrap();
+
+        let handle = tokio::spawn(async move { proc.transform().await });
+        // `collect_writer` must run concurrently with the wait below, not just
+        // after it: `writer.write_str().await` blocks until something drains
+        // and ACKs the WriterBridge, so without an active reader `transform()`
+        // would stall forever on its very first write, never reaching the
+        // tick-processing code the rest of this test depends on.
+        let collector = tokio::spawn(collect_writer(bridge));
+
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        capped_bridge.close();
+
+        let transform_result = handle.await.unwrap();
+        transform_result.unwrap();
+        let (received, _) = collector.await.unwrap();
+        let text = String::from_utf8(received.concat()).unwrap();
+        assert!(
+            text.contains("reactedToStatus") && text.contains("\"silent\""),
+            "expected a fact derived from the silence_event marker in output, got: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn silence_event_without_subject_timeout_is_rejected() {
+        let capped = make_test_reader("mock://capped", vec![]);
+        let dummy_window = make_test_reader("mock://reader", vec![]);
+        let (writer, bridge) = make_writer("mock://writer".to_string());
+        let proc: super::Kolibrie = make_test_processor(
+            json!({
+                "readers": [{"@type": "https://w3id.org/rdf-connect#Reader", "@id": "mock://reader"}],
+                "writer": {"@type": "https://w3id.org/rdf-connect#Writer", "@id": "mock://writer"},
+                "rsp_query": SINGLE_STREAM_QUERY,
+                "rules": RULES,
+                "capped_reader": {"@type": "https://w3id.org/rdf-connect#Reader", "@id": "mock://capped"},
+                "max_per_subject": 2,
+                "silence_event": "{subject} <http://example.org/status> \"silent\" ."
+            }),
+            [("reader", dummy_window), ("capped", capped)],
+            [("writer", writer)],
+        );
+        let (result, _) = tokio::join!(proc.transform(), collect_writer(bridge));
+        assert!(result.is_err(), "expected an error, silence_event requires subject_timeout");
+    }
+
+    #[tokio::test]
+    async fn subject_timeout_without_capped_reader_is_rejected() {
+        let dummy_window = make_test_reader("mock://reader", vec![]);
+        let (writer, bridge) = make_writer("mock://writer".to_string());
+        let proc: super::Kolibrie = make_test_processor(
+            json!({
+                "readers": [{"@type": "https://w3id.org/rdf-connect#Reader", "@id": "mock://reader"}],
+                "writer": {"@type": "https://w3id.org/rdf-connect#Writer", "@id": "mock://writer"},
+                "rsp_query": SINGLE_STREAM_QUERY,
+                "rules": RULES,
+                "subject_timeout": 30
+            }),
+            [("reader", dummy_window)],
+            [("writer", writer)],
+        );
+        let (result, _) = tokio::join!(proc.transform(), collect_writer(bridge));
+        assert!(result.is_err(), "expected an error, subject_timeout requires capped_reader");
     }
 
     // ── RDF parser unit tests ──────────────────────────────────────────────────
