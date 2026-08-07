@@ -36,11 +36,16 @@ jobs:
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
             ext: so
+          # Built on a native arm64 runner rather than cross-compiled from
+          # x86_64: `kolibrie` pulls in pyo3 (via its `ml` sub-crate), which
+          # links `-lpython3.12`. Cross-linking that would need an aarch64
+          # libpython (PYO3_CROSS_LIB_DIR); the x86_64 runners only ship
+          # x86_64 Python dev libs, so the link fails with "skipping
+          # incompatible ... libpython3.12.so". Native arm64 runners are free
+          # for public repos.
           - target: aarch64-unknown-linux-gnu
-            os: ubuntu-latest
+            os: ubuntu-24.04-arm
             ext: so
-            cross_linker: aarch64-linux-gnu-gcc
-            cross_apt_package: gcc-aarch64-linux-gnu
           - target: aarch64-apple-darwin
             os: macos-14
             ext: dylib
@@ -54,13 +59,6 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
-
-      - name: Install cross-compilation linker
-        if: matrix.cross_apt_package != ''
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y ${{ matrix.cross_apt_package }}
-          echo "CARGO_TARGET_$(echo ${{ matrix.target }} | tr '[:lower:]-' '[:upper:]_')_LINKER=${{ matrix.cross_linker }}" >> "$GITHUB_ENV"
 
       # rdfc-processor-buildtools is only ever a `[build-dependencies]` entry
       # of the processor crate(s) here, never a workspace member, so cargo
