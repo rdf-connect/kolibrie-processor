@@ -32,8 +32,8 @@ rdfc-processor-sdk = "0.3.0"
 # version the runner uses — see rdfc_processor_sdk::ABI_TOKEN.
 abi_stable = "=0.11.3"
 
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
 
 # Kolibrie reasoning + RSP-QL streaming engine. Pulls in the full crate (including
 # its ml/pyo3/candle sub-crate, unused by this processor today) so we get the real
@@ -43,19 +43,19 @@ serde_json = "1"
 kolibrie = { git = "https://github.com/StreamIntelligenceLab/Kolibrie.git" }
 datalog = { git = "https://github.com/StreamIntelligenceLab/Kolibrie.git" }
 shared  = { git = "https://github.com/StreamIntelligenceLab/Kolibrie.git" }
-oxttl = "0.2.3"
-oxrdf = "0.3.3"
+oxttl = "0.2.5"
+oxrdf = "0.3.5"
 
 # Just the channel type (no reactor/runtime) — bridges the capped_reader
 # ticker thread (plain std::thread + std::thread::sleep, no ambient Tokio
 # runtime needed) into the async transform() loop. Safe under the SDK's
 # "don't rely on an ambient Tokio runtime" rule since `sync` alone pulls in
 # no reactor/timer driver.
-tokio = { version = "1", default-features = false, features = ["sync"] }
+tokio = { version = "1.54.1", default-features = false, features = ["sync"] }
 
 [build-dependencies]
 rdfc-processor-buildtools = "0.3.0"
 
 [dev-dependencies]
-tokio = { version = "1", features = ["macros", "rt", "time"] }
+tokio = { version = "1.54.1", features = ["macros", "rt", "time"] }
 
